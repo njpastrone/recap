@@ -103,7 +103,7 @@ get_claude_projects_dir() {
   local repo_dir="$1"
   # Claude Code encodes paths by replacing / with -
   local encoded
-  encoded=$(echo "$repo_dir" | sed 's|/|-|g')
+  encoded=$(echo "$repo_dir" | sed 's|[/ ]|-|g')
   local claude_dir="$HOME/.claude/projects/${encoded}"
   if [ -d "$claude_dir" ]; then
     echo "$claude_dir"
