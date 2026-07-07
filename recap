@@ -606,11 +606,10 @@ ${ALL_CONTEXT}
   echo ""
 
   if [ "$INTERACTIVE" = true ]; then
-    TMPFILE=$(mktemp /tmp/recap-context-XXXXXX)
-    echo "$PROMPT" > "$TMPFILE"
     echo -e "${DIM}Opening interactive Claude Code session...${RESET}"
-    claude < "$TMPFILE"
-    rm -f "$TMPFILE"
+    # Pass the prompt as an argument — redirecting stdin from a file makes
+    # claude run non-interactively and exit
+    claude "$PROMPT"
   else
     echo "$PROMPT" | claude -p
   fi
