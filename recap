@@ -112,12 +112,12 @@ get_claude_projects_dir() {
   fi
 }
 
-# Find the most recent Claude Code conversation for a given branch
-# Returns the last N human/assistant exchanges from that conversation
+# Find Claude Code conversations for a given branch that were active within
+# the lookback window (since_iso). Returns excerpts from each, newest first.
 get_branch_conversations() {
   local claude_dir="$1"
   local branch="$2"
-  local max_convos="${3:-1}"
+  local since_iso="$3"
 
   [ -z "$claude_dir" ] && return
 
@@ -136,15 +136,16 @@ get_branch_conversations() {
       latest_ts=$(grep "\"gitBranch\":\"${branch}\"" "$jsonl_file" 2>/dev/null \
         | jq -r '.timestamp // empty' 2>/dev/null \
         | sort -r | head -1)
-      if [ -n "$latest_ts" ]; then
+      # Only include sessions active within the lookback window
+      if [ -n "$latest_ts" ] && [[ "$latest_ts" > "$since_iso" ]]; then
         matching_sessions+=("${latest_ts}|${jsonl_file}")
       fi
     fi
   done < <(find "$claude_dir" -maxdepth 1 -name "*.jsonl" -type f 2>/dev/null)
 
-  # Sort by timestamp (newest first) and take top N
+  # Sort by timestamp (newest first)
   local sorted_sessions
-  sorted_sessions=$(printf '%s\n' "${matching_sessions[@]+"${matching_sessions[@]}"}" | sort -t'|' -k1 -r | head -n "$max_convos")
+  sorted_sessions=$(printf '%s\n' "${matching_sessions[@]+"${matching_sessions[@]}"}" | sort -t'|' -k1 -r)
 
   [ -z "$sorted_sessions" ] && return
 
@@ -207,6 +208,7 @@ collect_ai_context() {
 
   local since_date
   since_date=$(date -d "${DAYS} days ago" '+%Y-%m-%d' 2>/dev/null || date -v-"${DAYS}"d '+%Y-%m-%d' 2>/dev/null)
+  local since_iso="${since_date}T00:00:00Z"
 
   local current_branch
   current_branch=$(git branch --show-current 2>/dev/null || echo "detached")
@@ -269,7 +271,7 @@ collect_ai_context() {
   # Claude Code conversations for current branch (even if working tree is clean)
   if [ -n "$claude_dir" ]; then
     local current_convos
-    current_convos=$(get_branch_conversations "$claude_dir" "$current_branch" 1)
+    current_convos=$(get_branch_conversations "$claude_dir" "$current_branch" "$since_iso")
     if [ -n "$current_convos" ]; then
       ctx+="<claude_code_conversation branch=\"${current_branch}\">"$'\n'
       ctx+="$current_convos"$'\n'
@@ -344,7 +346,7 @@ collect_ai_context() {
     # Skip if we already showed it as current branch above
     if [ -n "$claude_dir" ] && [ "$branch" != "$current_branch" ]; then
       local branch_convos
-      branch_convos=$(get_branch_conversations "$claude_dir" "$branch" 1)
+      branch_convos=$(get_branch_conversations "$claude_dir" "$branch" "$since_iso")
       if [ -n "$branch_convos" ]; then
         ctx+=$'\n'"<claude_code_conversation branch=\"${branch}\">"$'\n'
         ctx+="$branch_convos"$'\n'
@@ -359,8 +361,6 @@ collect_ai_context() {
   # (agent might have been working on something that got stashed or rebased)
   if [ -n "$claude_dir" ]; then
     local recent_orphan_convos=""
-    local since_iso
-    since_iso="${since_date}T00:00:00Z"
 
     # Get all branches seen in recent conversations
     local recent_branches
@@ -375,7 +375,7 @@ collect_ai_context() {
       if ! git rev-parse --verify "$conv_branch" &>/dev/null; then
         # Branch doesn't exist locally anymore — this is an orphaned conversation
         local orphan_convo
-        orphan_convo=$(get_branch_conversations "$claude_dir" "$conv_branch" 1)
+        orphan_convo=$(get_branch_conversations "$claude_dir" "$conv_branch" "$since_iso")
         if [ -n "$orphan_convo" ]; then
           recent_orphan_convos+=$'\n'"<claude_code_conversation branch=\"${conv_branch}\" note=\"branch no longer exists locally\">"$'\n'
           recent_orphan_convos+="$orphan_convo"$'\n'
@@ -590,9 +590,14 @@ Give a clear, narrative briefing covering:
 
 Be concise and direct. Use the branch names as headers. Skip anything that's clean/boring.
 
-IMPORTANT: Each <claude_code_conversation> block has SESSION and LAST ACTIVE lines. For every branch that has one, end that branch's section with a line like:
-  📎 Session: \`claude --resume <session-id>\` (last active <date>)
-so the reader knows exactly which Claude Code conversation backs that work and how to pick it up again.
+IMPORTANT: Each <claude_code_conversation> block may contain SEVERAL sessions (each with SESSION and LAST ACTIVE lines), newest first. For each branch, classify every session as one of:
+  - OPEN — ended mid-work: an unanswered question, an unexecuted plan, mid-debugging, or work discussed that never landed in a commit (cross-check against the git context)
+  - SUPERSEDED — its loose ends were picked up by a later session on the same branch
+  - FINISHED — the work was completed and committed/merged
+
+End each branch's section with a \"Sessions\" list showing ONLY the OPEN ones:
+  📎 OPEN: \`claude --resume <session-id>\` (last active <date>) — one line on where it left off
+If none are open for a branch, say \"No open sessions — work appears wrapped up.\" Do not list superseded or finished sessions.
 
 <git_context>
 ${ALL_CONTEXT}
