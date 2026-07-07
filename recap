@@ -1,0 +1,646 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ─────────────────────────────────────────────────────────────
+# recap — get up to speed on what you were working on
+#
+# Usage:
+#   recap                  # scan current repo, last 3 days
+#   recap -d 7             # last 7 days
+#   recap -r ~/projects    # scan all git repos under a directory
+#   recap --ai             # pipe everything to Claude for a narrative briefing
+#   recap --ai -i          # open interactive Claude Code session with context
+# ─────────────────────────────────────────────────────────────
+
+DAYS=3
+SCAN_DIR=""
+BASE_BRANCH=""
+ALL_BRANCHES=false
+MAX_COMMITS=5
+AI_MODE=false
+INTERACTIVE=false
+
+# Colors
+BOLD='\033[1m'
+DIM='\033[2m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+RESET='\033[0m'
+
+usage() {
+  echo "Usage: recap [OPTIONS]"
+  echo ""
+  echo "Options:"
+  echo "  -d DAYS     Look back N days (default: 3)"
+  echo "  -r DIR      Scan all git repos under DIR (recursive)"
+  echo "  -b BRANCH   Base branch to compare against (default: auto-detect main/master)"
+  echo "  -a          Show all branches, not just ones you authored"
+  echo "  -c N        Max commits to show per branch (default: 5)"
+  echo "  --ai        Pipe context to Claude for a narrative briefing"
+  echo "  -i          With --ai: open interactive Claude Code session"
+  echo "  -h          Show this help"
+  exit 0
+}
+
+# ── Pre-parse long opts ──
+ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --ai) AI_MODE=true ;;
+    --interactive) INTERACTIVE=true ;;
+    *) ARGS+=("$arg") ;;
+  esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+while getopts "d:r:b:c:aih" opt; do
+  case $opt in
+    d) DAYS="$OPTARG" ;;
+    r) SCAN_DIR="$OPTARG" ;;
+    b) BASE_BRANCH="$OPTARG" ;;
+    a) ALL_BRANCHES=true ;;
+    c) MAX_COMMITS="$OPTARG" ;;
+    i) INTERACTIVE=true ;;
+    h) usage ;;
+    *) usage ;;
+  esac
+done
+
+# ─────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────
+
+detect_base_branch() {
+  local repo_dir="$1"
+  if [ -n "$BASE_BRANCH" ]; then
+    echo "$BASE_BRANCH"
+    return
+  fi
+  cd "$repo_dir"
+  for candidate in main master develop; do
+    if git rev-parse --verify "$candidate" &>/dev/null; then
+      echo "$candidate"
+      return
+    fi
+  done
+  git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "main"
+}
+
+get_user_email() {
+  git config user.email 2>/dev/null || echo ""
+}
+
+# ─────────────────────────────────────────────────────────────
+# Claude Code conversation finder
+# ─────────────────────────────────────────────────────────────
+
+# Map a repo path to its Claude Code projects folder
+get_claude_projects_dir() {
+  local repo_dir="$1"
+  # Claude Code encodes paths by replacing / with -
+  local encoded
+  encoded=$(echo "$repo_dir" | sed 's|/|-|g')
+  local claude_dir="$HOME/.claude/projects/${encoded}"
+  if [ -d "$claude_dir" ]; then
+    echo "$claude_dir"
+  else
+    echo ""
+  fi
+}
+
+# Find the most recent Claude Code conversation for a given branch
+# Returns the last N human/assistant exchanges from that conversation
+get_branch_conversations() {
+  local claude_dir="$1"
+  local branch="$2"
+  local max_convos="${3:-1}"
+
+  [ -z "$claude_dir" ] && return
+
+  # Find all JSONL files that mention this branch, get the most recent ones
+  local matching_sessions=()
+  while IFS= read -r jsonl_file; do
+    # Check if this file has entries for this branch
+    if grep -q "\"gitBranch\":\"${branch}\"" "$jsonl_file" 2>/dev/null; then
+      # Get the latest timestamp from this session for this branch
+      local latest_ts
+      latest_ts=$(grep "\"gitBranch\":\"${branch}\"" "$jsonl_file" 2>/dev/null \
+        | jq -r '.timestamp // empty' 2>/dev/null \
+        | sort -r | head -1)
+      if [ -n "$latest_ts" ]; then
+        matching_sessions+=("${latest_ts}|${jsonl_file}")
+      fi
+    fi
+  done < <(find "$claude_dir" -maxdepth 1 -name "*.jsonl" -type f 2>/dev/null)
+
+  # Sort by timestamp (newest first) and take top N
+  local sorted_sessions
+  sorted_sessions=$(printf '%s\n' "${matching_sessions[@]+"${matching_sessions[@]}"}" | sort -t'|' -k1 -r | head -n "$max_convos")
+
+  [ -z "$sorted_sessions" ] && return
+
+  while IFS='|' read -r _ts jsonl_file; do
+    [ -z "$jsonl_file" ] && continue
+
+    local session_id
+    session_id=$(basename "$jsonl_file" .jsonl)
+
+    # Get the timestamp of the latest activity
+    local last_activity
+    last_activity=$(grep "\"gitBranch\":\"${branch}\"" "$jsonl_file" 2>/dev/null \
+      | jq -r '.timestamp // empty' 2>/dev/null \
+      | sort -r | head -1)
+
+    echo "SESSION: ${session_id}"
+    echo "LAST ACTIVE: ${last_activity}"
+    echo ""
+
+    # Extract the last meaningful human/assistant messages
+    # Focus on: human messages (user prompts) and assistant text responses
+    # Skip tool calls, attachments, hooks etc — just the conversation
+    jq -r '
+      select(.type == "human" or .type == "assistant") |
+      if .type == "human" then
+        "USER: " + (
+          if (.message | type) == "string" then .message
+          elif (.message | type) == "array" then
+            [.message[] | select(.type == "text") | .text] | join(" ")
+          else ""
+          end
+        )
+      elif .type == "assistant" then
+        "CLAUDE: " + (
+          if (.message | type) == "string" then .message
+          elif (.message | type) == "array" then
+            [.message[] | select(.type == "text") | .text] | join(" ")
+          elif (.message.content | type) == "array" then
+            [.message.content[] | select(.type == "text") | .text] | join(" ")
+          else ""
+          end
+        )
+      else empty
+      end
+    ' "$jsonl_file" 2>/dev/null | grep -v '^USER: $' | grep -v '^CLAUDE: $' | tail -20
+
+    echo ""
+  done <<< "$sorted_sessions"
+}
+
+# ─────────────────────────────────────────────────────────────
+# AI context collector
+# ─────────────────────────────────────────────────────────────
+
+collect_ai_context() {
+  local repo_dir="$1"
+  cd "$repo_dir"
+
+  local repo_name
+  repo_name=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || basename "$repo_dir")
+
+  local base
+  base=$(detect_base_branch "$repo_dir")
+
+  local user_email
+  user_email=$(get_user_email)
+
+  local since_date
+  since_date=$(date -d "${DAYS} days ago" '+%Y-%m-%d' 2>/dev/null || date -v-"${DAYS}"d '+%Y-%m-%d' 2>/dev/null)
+
+  local current_branch
+  current_branch=$(git branch --show-current 2>/dev/null || echo "detached")
+
+  # Find Claude Code projects dir for this repo
+  local claude_dir
+  claude_dir=$(get_claude_projects_dir "$repo_dir")
+
+  local ctx=""
+
+  ctx+="<repo name=\"${repo_name}\" base_branch=\"${base}\" current_branch=\"${current_branch}\">"$'\n'
+
+  if [ -n "$claude_dir" ]; then
+    ctx+="(Claude Code conversation history available for this repo)"$'\n'
+  fi
+
+  # ── Working directory status ──
+  local status_output
+  status_output=$(git status --porcelain 2>/dev/null || true)
+  if [ -n "$status_output" ]; then
+    ctx+="<working_directory_status>"$'\n'
+    ctx+="Currently on branch: ${current_branch}"$'\n'$'\n'
+
+    local staged
+    staged=$(echo "$status_output" | grep -E '^[MADRC]' || true)
+    if [ -n "$staged" ]; then
+      ctx+="STAGED FILES:"$'\n'"$staged"$'\n'$'\n'
+    fi
+
+    local modified
+    modified=$(echo "$status_output" | grep -E '^ [MADRC]' || true)
+    if [ -n "$modified" ]; then
+      ctx+="MODIFIED (UNSTAGED) FILES:"$'\n'"$modified"$'\n'$'\n'
+    fi
+
+    local untracked
+    untracked=$(echo "$status_output" | grep -E '^\?\?' || true)
+    if [ -n "$untracked" ]; then
+      local untracked_count
+      untracked_count=$(echo "$untracked" | wc -l | xargs)
+      ctx+="UNTRACKED FILES (${untracked_count} total):"$'\n'
+      ctx+="$(echo "$untracked" | sed 's/^?? //')"$'\n'$'\n'
+    fi
+
+    local staged_diff
+    staged_diff=$(git diff --cached --stat 2>/dev/null || true)
+    if [ -n "$staged_diff" ]; then
+      ctx+="STAGED DIFF SUMMARY:"$'\n'"$staged_diff"$'\n'$'\n'
+    fi
+
+    local unstaged_diff
+    unstaged_diff=$(git diff --stat 2>/dev/null || true)
+    if [ -n "$unstaged_diff" ]; then
+      ctx+="UNSTAGED DIFF SUMMARY:"$'\n'"$unstaged_diff"$'\n'$'\n'
+    fi
+
+    # Claude Code conversations for current branch
+    if [ -n "$claude_dir" ]; then
+      local current_convos
+      current_convos=$(get_branch_conversations "$claude_dir" "$current_branch" 1)
+      if [ -n "$current_convos" ]; then
+        ctx+="<claude_code_conversation branch=\"${current_branch}\">"$'\n'
+        ctx+="$current_convos"$'\n'
+        ctx+="</claude_code_conversation>"$'\n'
+      fi
+    fi
+
+    ctx+="</working_directory_status>"$'\n'
+  fi
+
+  # ── Branches ──
+  while IFS= read -r branch; do
+    [ -z "$branch" ] && continue
+    branch="${branch#\* }"
+    branch="${branch## }"
+    branch="${branch%%->*}"
+    branch=$(echo "$branch" | xargs)
+
+    [ -z "$branch" ] || [ "$branch" = "$base" ] && continue
+
+    local last_commit_epoch
+    last_commit_epoch=$(git log -1 --format='%at' "$branch" -- 2>/dev/null || echo "0")
+    local since_epoch
+    since_epoch=$(date -d "$since_date" '+%s' 2>/dev/null || date -j -f '%Y-%m-%d' "$since_date" '+%s' 2>/dev/null || echo "0")
+
+    [ "$last_commit_epoch" -lt "$since_epoch" ] && continue
+
+    if [ "$ALL_BRANCHES" = false ]; then
+      local author
+      author=$(git log -1 --format='%ae' "$branch" -- 2>/dev/null || echo "")
+      if [ -n "$user_email" ] && [ "$author" != "$user_email" ]; then
+        continue
+      fi
+    fi
+
+    local ahead behind
+    ahead=$(git rev-list --count "${base}..${branch}" 2>/dev/null || echo "?")
+    behind=$(git rev-list --count "${branch}..${base}" 2>/dev/null || echo "?")
+
+    local is_current=""
+    [ "$branch" = "$current_branch" ] && is_current=" (CURRENT BRANCH)"
+
+    ctx+=$'\n'
+    ctx+="<branch name=\"${branch}\"${is_current} ahead=\"${ahead}\" behind=\"${behind}\" base=\"${base}\">"$'\n'
+
+    # Commits
+    ctx+="COMMITS (vs ${base}):"$'\n'
+    ctx+="$(git log "$branch" --not "$base" --oneline --format="%h %ar  %s" -n 15 2>/dev/null || true)"$'\n'
+
+    # Files changed
+    ctx+=$'\n'"FILES CHANGED (vs ${base}):"$'\n'
+    ctx+="$(git diff --name-status "${base}...${branch}" 2>/dev/null | head -50 || true)"$'\n'
+
+    # Diff preview
+    local branch_diff
+    branch_diff=$(git diff "${base}...${branch}" 2>/dev/null | head -300 || true)
+    if [ -n "$branch_diff" ]; then
+      ctx+=$'\n'"DIFF PREVIEW (first 300 lines):"$'\n'"$branch_diff"$'\n'
+    fi
+
+    # TODOs
+    local todos
+    todos=$(git diff "${base}...${branch}" 2>/dev/null | grep -E '^\+.*\b(TODO|FIXME|HACK|XXX|WORKAROUND)\b' | head -10 || true)
+    if [ -n "$todos" ]; then
+      ctx+=$'\n'"TODOs/FIXMEs INTRODUCED:"$'\n'"$(echo "$todos" | sed 's/^\+//')"$'\n'
+    fi
+
+    # Agent status file
+    if git show "${branch}:.agent-status.md" &>/dev/null; then
+      ctx+=$'\n'"AGENT STATUS FILE (.agent-status.md):"$'\n'
+      ctx+="$(git show "${branch}:.agent-status.md" 2>/dev/null)"$'\n'
+    fi
+
+    # Claude Code conversations for this branch
+    # Skip if we already showed it as current branch above
+    if [ -n "$claude_dir" ] && [ "$branch" != "$current_branch" ]; then
+      local branch_convos
+      branch_convos=$(get_branch_conversations "$claude_dir" "$branch" 1)
+      if [ -n "$branch_convos" ]; then
+        ctx+=$'\n'"<claude_code_conversation branch=\"${branch}\">"$'\n'
+        ctx+="$branch_convos"$'\n'
+        ctx+="</claude_code_conversation>"$'\n'
+      fi
+    fi
+
+    ctx+="</branch>"$'\n'
+  done < <(git branch 2>/dev/null)
+
+  # ── Also find recent conversations that don't match any active branch ──
+  # (agent might have been working on something that got stashed or rebased)
+  if [ -n "$claude_dir" ]; then
+    local recent_orphan_convos=""
+    local since_iso
+    since_iso="${since_date}T00:00:00Z"
+
+    # Get all branches seen in recent conversations
+    local recent_branches
+    recent_branches=$(find "$claude_dir" -maxdepth 1 -name "*.jsonl" -type f -exec \
+      jq -r "select(.timestamp != null and .timestamp >= \"${since_iso}\") | .gitBranch // empty" {} \; 2>/dev/null \
+      | sort -u || true)
+
+    # Find branches in conversations that aren't in our active branch list
+    while IFS= read -r conv_branch; do
+      [ -z "$conv_branch" ] && continue
+      # Check if we already covered this branch
+      if ! git rev-parse --verify "$conv_branch" &>/dev/null; then
+        # Branch doesn't exist locally anymore — this is an orphaned conversation
+        local orphan_convo
+        orphan_convo=$(get_branch_conversations "$claude_dir" "$conv_branch" 1)
+        if [ -n "$orphan_convo" ]; then
+          recent_orphan_convos+=$'\n'"<claude_code_conversation branch=\"${conv_branch}\" note=\"branch no longer exists locally\">"$'\n'
+          recent_orphan_convos+="$orphan_convo"$'\n'
+          recent_orphan_convos+="</claude_code_conversation>"$'\n'
+        fi
+      fi
+    done <<< "$recent_branches"
+
+    if [ -n "$recent_orphan_convos" ]; then
+      ctx+=$'\n'"<orphaned_conversations note=\"These conversations reference branches that no longer exist locally — may have been merged, rebased, or deleted\">"$'\n'
+      ctx+="$recent_orphan_convos"$'\n'
+      ctx+="</orphaned_conversations>"$'\n'
+    fi
+  fi
+
+  # ── Stashes ──
+  local stash_list
+  stash_list=$(git stash list 2>/dev/null || true)
+  if [ -n "$stash_list" ]; then
+    ctx+=$'\n'"<stashes>"$'\n'"$stash_list"$'\n'
+    local i=0
+    while IFS= read -r stash_entry; do
+      [ $i -ge 5 ] && break
+      ctx+=$'\n'"${stash_entry}:"$'\n'
+      ctx+="$(git stash show "stash@{$i}" 2>/dev/null || true)"$'\n'
+      i=$((i + 1))
+    done <<< "$stash_list"
+    ctx+="</stashes>"$'\n'
+  fi
+
+  ctx+="</repo>"$'\n'
+
+  echo "$ctx"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Standard (non-AI) recap
+# ─────────────────────────────────────────────────────────────
+
+recap_repo() {
+  local repo_dir="$1"
+  cd "$repo_dir"
+
+  local repo_name
+  repo_name=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || basename "$repo_dir")
+
+  local base
+  base=$(detect_base_branch "$repo_dir")
+
+  local user_email
+  user_email=$(get_user_email)
+
+  local since_date
+  since_date=$(date -d "${DAYS} days ago" '+%Y-%m-%d' 2>/dev/null || date -v-"${DAYS}"d '+%Y-%m-%d' 2>/dev/null)
+
+  local current_branch
+  current_branch=$(git branch --show-current 2>/dev/null || echo "detached")
+
+  local branches=()
+  while IFS= read -r branch; do
+    [ -z "$branch" ] && continue
+    branch="${branch#\* }"
+    branch="${branch## }"
+    branch="${branch%%->*}"
+    branch=$(echo "$branch" | xargs)
+
+    [ -z "$branch" ] || [ "$branch" = "$base" ] && continue
+
+    local last_commit_epoch
+    last_commit_epoch=$(git log -1 --format='%at' "$branch" -- 2>/dev/null || echo "0")
+    local since_epoch
+    since_epoch=$(date -d "$since_date" '+%s' 2>/dev/null || date -j -f '%Y-%m-%d' "$since_date" '+%s' 2>/dev/null || echo "0")
+
+    if [ "$last_commit_epoch" -ge "$since_epoch" ]; then
+      if [ "$ALL_BRANCHES" = true ]; then
+        branches+=("$branch")
+      else
+        local author
+        author=$(git log -1 --format='%ae' "$branch" -- 2>/dev/null || echo "")
+        if [ "$author" = "$user_email" ] || [ -z "$user_email" ]; then
+          branches+=("$branch")
+        fi
+      fi
+    fi
+  done < <(git branch 2>/dev/null)
+
+  local has_uncommitted=false
+  local uncommitted_count
+  uncommitted_count=$(git status --porcelain 2>/dev/null | wc -l | xargs)
+  [ "$uncommitted_count" -gt 0 ] && has_uncommitted=true
+
+  local branch_count=${#branches[@]}
+  if [ "$branch_count" -eq 0 ] && [ "$has_uncommitted" = false ]; then
+    return
+  fi
+
+  echo ""
+  echo -e "${BOLD}${BLUE}╔══════════════════════════════════════════════════════════════╗${RESET}"
+  printf "${BOLD}${BLUE}║${RESET} ${BOLD}%-60s${RESET} ${BOLD}${BLUE}║${RESET}\n" "📁 $repo_name"
+  echo -e "${BOLD}${BLUE}╚══════════════════════════════════════════════════════════════╝${RESET}"
+  echo -e "  ${DIM}base: ${base} | current: ${current_branch} | looking back: ${DAYS}d${RESET}"
+
+  if [ "$has_uncommitted" = true ]; then
+    echo ""
+    echo -e "  ${YELLOW}⚠  Uncommitted changes on ${BOLD}${current_branch}${RESET}${YELLOW}:${RESET}"
+
+    local staged modified untracked
+    staged=$(git diff --cached --stat 2>/dev/null | tail -1)
+    modified=$(git diff --stat 2>/dev/null | tail -1)
+    untracked=$(git ls-files --others --exclude-standard 2>/dev/null | wc -l | xargs)
+
+    [ -n "$staged" ] && echo -e "     ${GREEN}staged:${RESET}    $staged"
+    [ -n "$modified" ] && echo -e "     ${RED}modified:${RESET}  $modified"
+    [ "$untracked" -gt 0 ] && echo -e "     ${DIM}untracked:${RESET} $untracked file(s)"
+  fi
+
+  for branch in ${branches[@]+"${branches[@]}"}; do
+    echo ""
+    local is_current=""
+    [ "$branch" = "$current_branch" ] && is_current=" ${GREEN}← you are here${RESET}"
+
+    echo -e "  ${BOLD}${CYAN}▸ ${branch}${RESET}${is_current}"
+
+    local ahead behind
+    ahead=$(git rev-list --count "${base}..${branch}" 2>/dev/null || echo "?")
+    behind=$(git rev-list --count "${branch}..${base}" 2>/dev/null || echo "?")
+    echo -e "    ${DIM}↑${ahead} ahead / ↓${behind} behind ${base}${RESET}"
+
+    echo -e "    ${DIM}recent commits:${RESET}"
+    git log "$branch" --not "$base" --oneline --format="    %C(auto)%h %C(dim)%ar%C(reset)  %s" \
+      -n "$MAX_COMMITS" 2>/dev/null || true
+
+    local total_commits
+    total_commits=$(git rev-list --count "${base}..${branch}" 2>/dev/null || echo "0")
+    if [ "$total_commits" -gt "$MAX_COMMITS" ]; then
+      echo -e "    ${DIM}... and $((total_commits - MAX_COMMITS)) more${RESET}"
+    fi
+
+    local files_changed
+    files_changed=$(git diff --name-only "${base}...${branch}" 2>/dev/null | wc -l | xargs)
+    if [ "$files_changed" -gt 0 ]; then
+      echo -e "    ${DIM}files changed vs ${base}: ${files_changed}${RESET}"
+      git diff --stat "${base}...${branch}" 2>/dev/null | tail -1 | sed 's/^/    /'
+    fi
+
+    local todos
+    todos=$(git diff "${base}...${branch}" 2>/dev/null | grep -E '^\+.*\b(TODO|FIXME|HACK|XXX|WORKAROUND)\b' | head -5 || true)
+    if [ -n "$todos" ]; then
+      echo -e "    ${YELLOW}⚑ TODOs/FIXMEs introduced:${RESET}"
+      echo "$todos" | sed 's/^\+//' | sed 's/^/      /' | head -5
+    fi
+
+    if git show "${branch}:.agent-status.md" &>/dev/null; then
+      echo -e "    ${MAGENTA}📋 .agent-status.md found on this branch${RESET}"
+      git show "${branch}:.agent-status.md" 2>/dev/null | head -10 | sed 's/^/      /'
+    fi
+  done
+
+  local stash_count
+  stash_count=$(git stash list 2>/dev/null | wc -l | xargs)
+  if [ "$stash_count" -gt 0 ]; then
+    echo ""
+    echo -e "  ${MAGENTA}📦 ${stash_count} stash(es):${RESET}"
+    git stash list 2>/dev/null | head -5 | sed 's/^/    /'
+  fi
+
+  echo ""
+  echo -e "  ${DIM}────────────────────────────────────────────${RESET}"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────
+
+if [ "$AI_MODE" = true ]; then
+  echo -e "${BOLD}🔄 recap --ai${RESET} ${DIM}— collecting context (last ${DAYS} day(s))...${RESET}"
+
+  ALL_CONTEXT=""
+
+  if [ -n "$SCAN_DIR" ]; then
+    while IFS= read -r git_dir; do
+      repo_dir=$(dirname "$git_dir")
+      repo_ctx=$(collect_ai_context "$repo_dir")
+      ALL_CONTEXT+="$repo_ctx"$'\n'
+    done < <(find "$SCAN_DIR" -maxdepth 3 -name ".git" -type d 2>/dev/null)
+  else
+    if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+      echo -e "  ${RED}Not in a git repo. Use -r DIR to scan a directory.${RESET}"
+      exit 1
+    fi
+    repo_root=$(git rev-parse --show-toplevel)
+    ALL_CONTEXT=$(collect_ai_context "$repo_root")
+  fi
+
+  PROMPT="You are a senior dev reviewing the state of a codebase to brief someone who's returning after time away.
+
+Below is raw git context (branches, commits, diffs, untracked files, stashes) AND excerpts from recent Claude Code conversations that were used to build each feature/fix.
+
+Give a clear, narrative briefing covering:
+
+1. **What's in progress** — For each active branch, explain what the feature/fix is about (infer from commits, diffs, AND the Claude Code conversation history), how far along it seems, and what likely remains. The conversations are especially useful here — they show what was planned, what problems came up, and what the intended next steps were.
+
+2. **What needs attention** — Uncommitted/unstaged changes, things that look half-done, merge conflicts, branches behind main.
+
+3. **Untracked files** — Explain what they likely are (generated output? test data? new source files that should be committed? build artifacts that need gitignoring?). Group them by pattern.
+
+4. **Stashes** — What's in them and whether they look like they still matter or are safe to drop.
+
+5. **Orphaned conversations** — If there are Claude Code conversations referencing branches that no longer exist, mention what they were about — work may have been merged, rebased, or abandoned.
+
+6. **Suggested next steps** — What would you work on first? What should get committed, merged, or cleaned up?
+
+Be concise and direct. Use the branch names as headers. Skip anything that's clean/boring.
+
+<git_context>
+${ALL_CONTEXT}
+</git_context>"
+
+  if ! command -v claude &>/dev/null; then
+    echo -e "${RED}Error: 'claude' CLI not found. Install Claude Code first.${RESET}"
+    echo -e "${DIM}Falling back to raw context dump:${RESET}"
+    echo ""
+    echo "$ALL_CONTEXT"
+    exit 1
+  fi
+
+  echo -e "${DIM}Piping to Claude for briefing...${RESET}"
+  echo ""
+
+  if [ "$INTERACTIVE" = true ]; then
+    TMPFILE=$(mktemp /tmp/recap-context-XXXXXX)
+    echo "$PROMPT" > "$TMPFILE"
+    echo -e "${DIM}Opening interactive Claude Code session...${RESET}"
+    claude < "$TMPFILE"
+    rm -f "$TMPFILE"
+  else
+    echo "$PROMPT" | claude -p
+  fi
+
+else
+  echo ""
+  echo -e "${BOLD}🔄 recap${RESET} ${DIM}— last ${DAYS} day(s)${RESET}"
+
+  if [ -n "$SCAN_DIR" ]; then
+    found=0
+    while IFS= read -r git_dir; do
+      repo_dir=$(dirname "$git_dir")
+      recap_repo "$repo_dir"
+      found=$((found + 1))
+    done < <(find "$SCAN_DIR" -maxdepth 3 -name ".git" -type d 2>/dev/null)
+
+    if [ "$found" -eq 0 ]; then
+      echo -e "  ${DIM}No git repos found under ${SCAN_DIR}${RESET}"
+    fi
+  else
+    if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+      echo -e "  ${RED}Not in a git repo. Use -r DIR to scan a directory.${RESET}"
+      exit 1
+    fi
+    repo_root=$(git rev-parse --show-toplevel)
+    recap_repo "$repo_root"
+  fi
+
+  echo ""
+  echo -e "${DIM}Done. Run 'recap --ai' for a Claude-powered briefing, or 'recap -d 7' for a wider window.${RESET}"
+fi
