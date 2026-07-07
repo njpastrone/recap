@@ -590,6 +590,10 @@ Give a clear, narrative briefing covering:
 
 Be concise and direct. Use the branch names as headers. Skip anything that's clean/boring.
 
+IMPORTANT: Each <claude_code_conversation> block has SESSION and LAST ACTIVE lines. For every branch that has one, end that branch's section with a line like:
+  📎 Session: \`claude --resume <session-id>\` (last active <date>)
+so the reader knows exactly which Claude Code conversation backs that work and how to pick it up again.
+
 <git_context>
 ${ALL_CONTEXT}
 </git_context>"
